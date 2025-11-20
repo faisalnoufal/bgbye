@@ -4,54 +4,23 @@ from fastapi.responses import FileResponse
 from PIL import Image
 import io
 import shutil
-from rembg import remove as rembg_remove, new_session
 import time
 import numpy as np
 import tempfile
 import uuid  
 import os
 import subprocess
-from transformers import pipeline
-from transparent_background import Remover
 import logging
 import asyncio
 from datetime import datetime, timedelta
 import torch
-from ormbg import ORMBGProcessor 
 from typing import Dict
 from contextlib import contextmanager
-
-from carvekit.ml.files.models_loc import download_all
-
-download_all()
-
-from carvekit.ml.wrap.u2net import U2NET
-from carvekit.ml.wrap.basnet import BASNET
-from carvekit.ml.wrap.fba_matting import FBAMatting
-from carvekit.ml.wrap.deeplab_v3 import DeepLabV3
-from carvekit.ml.wrap.tracer_b7 import TracerUniversalB7
-from carvekit.api.interface import Interface
-from carvekit.pipelines.postprocessing import MattingMethod
-from carvekit.pipelines.preprocessing import PreprocessingStub
-from carvekit.trimap.generator import TrimapGenerator
 
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
-
-# Add ORMBG model initialization
-ormbg_model_path = os.path.expanduser("~/.ormbg/ormbg.pth")
-try:
-    ormbg_processor = ORMBGProcessor(ormbg_model_path)
-    if torch.cuda.is_available():
-        ormbg_processor.to("cuda")
-    else:
-        ormbg_processor.to("cpu")
-except FileNotFoundError:
-    logger.error(f"ORMBG model file not found: {ormbg_model_path}")
-    print("Error: ORMBG model file not found. Please run 'npm run setup-server' to download it.")
-    exit(1)
 
 app = FastAPI()
 
@@ -90,120 +59,90 @@ async def cleanup_old_videos():
                     logger.info(f"Removed old directory: {item_path}")
         await asyncio.sleep(600)  # Run every 10 minutes
 
-# Pre-load all models
-bria_model = pipeline("image-segmentation", model="briaai/RMBG-1.4", trust_remote_code=True, device="cpu")
-inspyrenet_model = Remover()
-inspyrenet_model.model.cpu()
-rembg_models = {
-    'u2net': new_session('u2net'),
-    'u2net_human_seg': new_session('u2net_human_seg'),
-    'isnet-general-use': new_session('isnet-general-use'),
-    'isnet-anime': new_session('isnet-anime')
-}
-
-# Initialize Carvekit models
-def initialize_carvekit_model(seg_pipe_class, device='cuda'):
-    model = Interface(
-        pre_pipe=PreprocessingStub(),
-        post_pipe=MattingMethod(
-            matting_module=FBAMatting(device=device, input_tensor_size=2048, batch_size=1),
-            trimap_generator=TrimapGenerator(),
-            device=device
-        ),
-        seg_pipe=seg_pipe_class(device=device, batch_size=1)
-    )
-    model.segmentation_pipeline.to('cpu')
-    return model
-
-carvekit_models = {
-    'u2net': initialize_carvekit_model(U2NET),
-    'tracer': initialize_carvekit_model(TracerUniversalB7),
-    'basnet': initialize_carvekit_model(BASNET),
-    'deeplab': initialize_carvekit_model(DeepLabV3)
-}
-
-# Ensure GPU memory is cleared after initialization
-torch.cuda.empty_cache()
-
-def process_with_bria(image):
-    result = bria_model(image, return_mask=True)
-    mask = result
-    if not isinstance(mask, Image.Image):
-        mask = Image.fromarray((mask * 255).astype('uint8'))
-    no_bg_image = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    no_bg_image.paste(image, mask=mask)
-    return no_bg_image
-
-def process_with_ormbg(image):
-    result = ormbg_processor.process_image(image)
-    return result
-
-def process_with_inspyrenet(image):
-    return inspyrenet_model.process(image, type='rgba')
-
-def process_with_rembg(image, model='u2net'):
-    return rembg_remove(image, session=rembg_models[model])
-
-def process_with_carvekit(image, model='u2net'):
-    # Initialize segmentation network based on model input
-    if model == 'u2net':
-        seg_net = U2NET(device='cuda', batch_size=1)
-    elif model == 'tracer':
-        seg_net = TracerUniversalB7(device='cuda', batch_size=1)
-    elif model == 'basnet':
-        seg_net = BASNET(device='cuda', batch_size=1)
-    elif model == 'deeplab':
-        seg_net = DeepLabV3(device='cuda', batch_size=1)
-    else:
-        raise ValueError("Unsupported model type")
-
-    # Setup the post-processing components
-    fba = FBAMatting(device='cuda', input_tensor_size=2048, batch_size=1)
-    trimap = TrimapGenerator()
-    preprocessing = PreprocessingStub()
-    postprocessing = MattingMethod(matting_module=fba, trimap_generator=trimap, device='cuda')
-
-    interface = Interface(pre_pipe=preprocessing, post_pipe=postprocessing, seg_pipe=seg_net)
-    processed_image = interface([image])[0]
+# Pre-load models - Tracer-B7, BASNet, and RMBG-2.0
+# Import carvekit for tracer and basnet
+carvekit_available = False
+try:
+    from carvekit.ml.wrap.tracer_b7 import TracerUniversalB7
+    from carvekit.ml.wrap.basnet import BASNET
+    from carvekit.ml.wrap.fba_matting import FBAMatting
+    from carvekit.api.interface import Interface
+    from carvekit.pipelines.postprocessing import MattingMethod
+    from carvekit.pipelines.preprocessing import PreprocessingStub
+    from carvekit.trimap.generator import TrimapGenerator
     
-    return processed_image
+    def initialize_carvekit_model(seg_pipe_class, device='cpu'):
+        model = Interface(
+            pre_pipe=PreprocessingStub(),
+            post_pipe=MattingMethod(
+                matting_module=FBAMatting(device=device, input_tensor_size=2048, batch_size=1),
+                trimap_generator=TrimapGenerator(),
+                device=device
+            ),
+            seg_pipe=seg_pipe_class(device=device, batch_size=1)
+        )
+        return model
+    
+    carvekit_models = {
+        'tracer': initialize_carvekit_model(TracerUniversalB7, device='cpu'),
+        'basnet': initialize_carvekit_model(BASNET, device='cpu')
+    }
+    carvekit_available = True
+    logger.info("Carvekit models loaded: Tracer-B7 and BASNet available")
+except ImportError as e:
+    logger.error(f"Carvekit not available: {e}. Cannot start server.")
+    exit(1)
 
-@contextmanager
-def inspyrenet_video_model_context():
-    try:
-        model = Remover()
-        model.model.cuda()
-        yield model
-    finally:
-        model.model.cpu()
-        del model
-        torch.cuda.empty_cache()
+# Initialize RMBG-2.0 model
+rmbg_available = False
+try:
+    from transformers import AutoModelForImageSegmentation
+    from torchvision import transforms
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    rmbg_model = AutoModelForImageSegmentation.from_pretrained('briaai/RMBG-2.0', trust_remote_code=True)
+    rmbg_model.eval()
+    rmbg_model.to(device)
+    
+    # RMBG-2.0 preprocessing transform
+    rmbg_transform = transforms.Compose([
+        transforms.Resize((1024, 1024)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    rmbg_available = True
+    logger.info("RMBG-2.0 model loaded successfully")
+except Exception as e:
+    logger.warning(f"RMBG-2.0 not available: {e}")
 
-@contextmanager
-def carvekit_video_model_context(model_name):
-    try:
-        if model_name == 'u2net':
-            seg_net = U2NET(device='cuda', batch_size=1)
-        elif model_name == 'tracer':
-            seg_net = TracerUniversalB7(device='cuda', batch_size=1)
-        elif model_name == 'basnet':
-            seg_net = BASNET(device='cuda', batch_size=1)
-        elif model_name == 'deeplab':
-            seg_net = DeepLabV3(device='cuda', batch_size=1)
-        else:
-            raise ValueError("Unsupported model type")
+available_models = "Tracer-B7, BASNet"
+if rmbg_available:
+    available_models += ", RMBG-2.0"
+logger.info(f"Available models: {available_models}")
 
-        fba = FBAMatting(device='cuda', input_tensor_size=2048, batch_size=1)
-        trimap = TrimapGenerator()
-        preprocessing = PreprocessingStub()
-        postprocessing = MattingMethod(matting_module=fba, trimap_generator=trimap, device='cuda')
 
-        interface = Interface(pre_pipe=preprocessing, post_pipe=postprocessing, seg_pipe=seg_net)
-        yield interface
-    finally:
-        del seg_net, fba, trimap, preprocessing, postprocessing, interface
-        torch.cuda.empty_cache()
-
+def process_with_rmbg(image):
+    """Process image with RMBG-2.0 model"""
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Preprocess
+    input_tensor = rmbg_transform(image).unsqueeze(0).to(device)
+    
+    # Predict
+    with torch.no_grad():
+        preds = rmbg_model(input_tensor)[-1].sigmoid().cpu()
+    pred = preds[0].squeeze()
+    
+    # Convert to PIL mask
+    pred_pil = transforms.ToPILImage()(pred)
+    mask = pred_pil.resize(image.size)
+    
+    # Apply mask to image
+    result = image.copy()
+    result.putalpha(mask)
+    
+    return result
 
 # Create a global lock for GPU operations
 gpu_lock = asyncio.Lock()
@@ -217,38 +156,24 @@ async def remove_background(file: UploadFile = File(...), method: str = Form(...
         start_time = time.time()
 
         async def process_image():
-            if method == 'bria':
-                return await asyncio.to_thread(process_with_bria, image)
-            elif method == 'inspyrenet':
-                async with gpu_lock:
-                    try:
-                        inspyrenet_model.model.to('cuda')
-                        result = await asyncio.to_thread(inspyrenet_model.process, image, type='rgba')
-                    finally:
-                        inspyrenet_model.model.to('cpu')
-                    return result
-            elif method in ['u2net_human_seg', 'isnet-general-use', 'isnet-anime']:
-                return await asyncio.to_thread(process_with_rembg, image, model=method)
-            elif method == 'ormbg':
-                return await asyncio.to_thread(process_with_ormbg, image)
-            elif method in ['u2net', 'tracer', 'basnet', 'deeplab']:
-                async with gpu_lock:
-                    try:
-                        carvekit_models[method].segmentation_pipeline.to('cuda')
-                        result = await asyncio.to_thread(carvekit_models[method], [image])
-                    finally:
-                        carvekit_models[method].segmentation_pipeline.to('cpu')
-                    return result[0]
+            if method in ['tracer', 'basnet']:
+                # Use CPU for carvekit models (no GPU required)
+                result = await asyncio.to_thread(carvekit_models[method], [image])
+                return result[0]
+            elif method == 'rmbg' and rmbg_available:
+                # Use RMBG-2.0 model
+                result = await asyncio.to_thread(process_with_rmbg, image)
+                return result
             else:
-                raise HTTPException(status_code=400, detail="Invalid method")
+                available = "tracer, basnet"
+                if rmbg_available:
+                    available += ", rmbg"
+                raise HTTPException(status_code=400, detail=f"Method '{method}' not available. Available methods: {available}")
 
         no_bg_image = await process_image()
         
         process_time = time.time() - start_time
         print(f"Background removal time ({method}): {process_time:.2f} seconds")
-        
-        async with gpu_lock:
-            torch.cuda.empty_cache()
         
         with io.BytesIO() as output:
             no_bg_image.save(output, format="PNG")
@@ -263,16 +188,20 @@ async def remove_background(file: UploadFile = File(...), method: str = Form(...
 async def process_frame(frame_path, method):
     img = Image.open(frame_path).convert('RGB')
     
-    if method == 'bria':
-        processed_frame = await asyncio.to_thread(process_with_bria, img)
-    elif method in ['u2net_human_seg', 'isnet-general-use', 'isnet-anime']:
-        processed_frame = await asyncio.to_thread(process_with_rembg, img, model=method)
-    elif method == 'ormbg':
-        processed_frame = await asyncio.to_thread(process_with_ormbg, img)
+    if method in ['tracer', 'basnet']:
+        # For video processing, we'll handle carvekit models in the main loop
+        raise ValueError(f"Method '{method}' should be processed in the batch loop")
+    elif method == 'rmbg' and rmbg_available:
+        # Process with RMBG-2.0
+        processed_frame = await asyncio.to_thread(process_with_rmbg, img)
+        return processed_frame
     else:
-        raise ValueError("Invalid method")
+        available = "tracer, basnet"
+        if rmbg_available:
+            available += ", rmbg"
+        raise ValueError(f"Method '{method}' not available. Available methods: {available}")
     
-    return processed_frame
+    return None
 
 async def process_video(video_path, method, video_id):
     try:
@@ -339,46 +268,49 @@ async def process_video(video_path, method, video_id):
             processing_status[video_id] = {'status': 'error', 'message': 'No frames were extracted from the video'}
             return
 
-        # Initialize the model once, outside the batch processing loop
-        if method == 'inspyrenet':
-            print("start init")
-            model_context = inspyrenet_video_model_context()
-            print("start enter")
-            model = model_context.__enter__()
-            print("finish enter")
-        elif method in ['u2net', 'tracer', 'basnet', 'deeplab']:
-            model_context = carvekit_video_model_context(method)
-            model = model_context.__enter__()
-        else:
-            model = None  # For other methods that don't require a specific model
-
-        try:
+        # Process frames with available models
+        if method in ['tracer', 'basnet']:
+            # Use carvekit model for batch processing (CPU only)
+            @contextmanager
+            def carvekit_video_model_context(model_name):
+                model = carvekit_models[model_name]
+                yield model
+            
+            with carvekit_video_model_context(method) as model:
+                async def process_frame_batch(start_idx, end_idx):
+                    for i in range(start_idx, min(end_idx, total_frames)):
+                        frame_file = frame_files[i]
+                        frame_path = os.path.join(frames_dir, frame_file)
+                        img = Image.open(frame_path).convert('RGB')
+                        processed_frame = await asyncio.to_thread(model, [img])
+                        processed_frame[0].save(frame_path, format='PNG')
+                        progress = (i + 1) / total_frames * 100
+                        processing_status[video_id] = {'status': 'processing', 'progress': progress}
+                
+                batch_size = 3
+                for i in range(0, total_frames, batch_size):
+                    await process_frame_batch(i, i + batch_size)
+                    await asyncio.sleep(0)  # Allow other tasks to run
+        elif method == 'rmbg' and rmbg_available:
+            # Use RMBG-2.0 for video processing
             async def process_frame_batch(start_idx, end_idx):
                 for i in range(start_idx, min(end_idx, total_frames)):
                     frame_file = frame_files[i]
                     frame_path = os.path.join(frames_dir, frame_file)
-                    img = Image.open(frame_path).convert('RGB')
-
-                    if method == 'inspyrenet':
-                        processed_frame = model.process(img, type='rgba')
-                    elif method in ['u2net', 'tracer', 'basnet', 'deeplab']:
-                        processed_frame = model([img])[0]
-                    else:
-                        processed_frame = await process_frame(frame_path, method)
-
+                    processed_frame = await process_frame(frame_path, method)
                     processed_frame.save(frame_path, format='PNG')
                     progress = (i + 1) / total_frames * 100
                     processing_status[video_id] = {'status': 'processing', 'progress': progress}
-
+            
             batch_size = 3
             for i in range(0, total_frames, batch_size):
                 await process_frame_batch(i, i + batch_size)
                 await asyncio.sleep(0)  # Allow other tasks to run
-
-        finally:
-            # Ensure we clean up the model context
-            if method in ['inspyrenet', 'u2net', 'tracer', 'basnet', 'deeplab']:
-                model_context.__exit__(None, None, None)
+        else:
+            available = "tracer, basnet"
+            if rmbg_available:
+                available += ", rmbg"
+            raise ValueError(f"Method '{method}' not available for video processing. Available methods: {available}")
 
         # Create output video
         processing_status[video_id] = {'status': 'processing', 'progress': 100, 'message': 'Encoding video'}
