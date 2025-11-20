@@ -45,6 +45,7 @@ const ImageUpload = ({ onProcessed, fileID, selectedModels, showErrorToast }) =>
   const [doZoom, setDoZoom] = useState(false);
 
   const [transparent, setTransparent] = useState(true);
+  const [dropShadow, setDropShadow] = useState(false);
   const [colorBG, setColorBG] = useState('radial-gradient(circle, #fcdfa4 0%, #ffd83b 100%)'); //useState('radial-gradient(circle, #87CEFA 0%, #1E90FF 100%)');
 
   const [imageWidth, setImageWidth] = useState('500px'); // Default width
@@ -461,11 +462,11 @@ return (
                     <ZoomInIcon color='primary'/>
                   </ToggleButton>
 
-                  {doZoom && <Magnifier src={processedFiles[activeMethod]} width={'100%'}/>}
+                  {doZoom && <Magnifier src={processedFiles[activeMethod]} width={'100%'} style={dropShadow ? { filter: 'drop-shadow(0px 10px 20px rgba(0, 0, 0, 0.5))' } : {}}/>}
                
                 {!doZoom && <ImgComparisonSlider class="slider-example-focus">
                   <img slot="first" src={selectedFile} alt="Original" style={{ width: '100%' }} />
-                  <img slot="second" src={processedFiles[activeMethod]} alt="Processed" style={{ width: '100%' }} />
+                  <img slot="second" src={processedFiles[activeMethod]} alt="Processed" style={dropShadow ? { width: '100%', filter: 'drop-shadow(0px 10px 20px rgba(0, 0, 0, 0.5))' } : { width: '100%' }} />
                   {false && <svg slot="handle" xmlns="http://www.w3.org/2000/svg" width="100" viewBox="-8 -3 16 6">
                     <path stroke="#549ef7" d="M -5 -2 L -7 0 L -5 2 M -5 -2 L -5 2 M 5 -2 L 7 0 L 5 2 M 5 -2 L 5 2" strokeWidth="1" fill="#549ef7" vectorEffect="non-scaling-stroke"></path>
                   </svg>}
@@ -593,6 +594,12 @@ return (
               {!isPortrait && fileType=='image' && <FormControlLabel
                   control={<Checkbox checked={transparent} onChange={(e)=>setTransparent(e.target.checked)} />}
                   label="Transparent"
+                  sx={{color:theme.palette.text.primary}}
+              />}
+              
+              {!isPortrait && fileType=='image' && <FormControlLabel
+                  control={<Checkbox checked={dropShadow} onChange={(e)=>setDropShadow(e.target.checked)} />}
+                  label="Drop Shadow"
                   sx={{color:theme.palette.text.primary}}
               />}
 
